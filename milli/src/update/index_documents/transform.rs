@@ -5,6 +5,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::time::Instant;
 
+use fst::MapBuilder;
 use heed::types::OwnedType;
 use heed::Database;
 use itertools::Itertools;
@@ -284,8 +285,8 @@ impl<'a, 'i> Transform<'a, 'i> {
 
         let (documents_count, replaced_documents_ids, documents_file) = Self::write_final_sorter(
             wtxn,
-            self.indexer_settings,
             self.sorter,
+            self.indexer_settings,
             &self.index.documents,
             self.index_documents_method,
             total_documents,
@@ -317,8 +318,10 @@ impl<'a, 'i> Transform<'a, 'i> {
     /// TODO: TAMO: documentation
     pub(crate) fn write_final_sorter<F>(
         wtxn: &heed::RwTxn,
-        indexer_settings: &IndexerConfig,
+        // normal parameters
         sorter: grenad::Sorter<MergeFn>,
+        // what should be in self
+        indexer_settings: &IndexerConfig,
         documents: &Database<OwnedType<BEU32>, ObkvCodec>,
         index_documents_method: IndexDocumentsMethod,
         total_documents: usize,
@@ -366,63 +369,34 @@ impl<'a, 'i> Transform<'a, 'i> {
                 });
             }
 
-            let (docid, obkv) = match external_documents_ids.get(external_id) {
-                Some(docid) => {
-                    // If we find the user id in the current external documents ids map
-                    // we use it and insert it in the list of replaced documents.
-                    replaced_documents_ids.insert(docid);
-
-                    let key = BEU32::new(docid);
-                    let base_obkv =
-                        documents.get(wtxn, &key)?.ok_or(InternalError::DatabaseMissingEntry {
-                            db_name: db_name::DOCUMENTS,
-                            key: None,
-                        })?;
-
-                    // we remove all the fields that were already counted
-                    for (field_id, _) in base_obkv.iter() {
-                        let field_name = fields_ids_map.name(field_id).unwrap();
-                        if let Entry::Occupied(mut entry) =
-                            field_distribution.entry(field_name.to_string())
-                        {
-                            match entry.get().checked_sub(1) {
-                                Some(0) | None => entry.remove(),
-                                Some(count) => entry.insert(count),
-                            };
-                        }
-                    }
-
-                    // Depending on the update indexing method we will merge
-                    // the document update with the current document or not.
-                    match index_documents_method {
-                        IndexDocumentsMethod::ReplaceDocuments => (docid, update_obkv),
-                        IndexDocumentsMethod::UpdateDocuments => {
-                            let update_obkv = obkv::KvReader::new(update_obkv);
-                            merge_two_obkvs(base_obkv, update_obkv, &mut obkv_buffer);
-                            (docid, obkv_buffer.as_slice())
-                        }
-                    }
-                }
+            let (docid, updated) = match external_documents_ids.get(external_id) {
+                Some(docid) => (docid, true),
                 None => {
-                    // If this user id is new we add it to the external documents ids map
-                    // for new ids and into the list of new documents.
                     let new_docid =
                         available_documents_ids.next().ok_or(UserError::DocumentLimitReached)?;
-                    new_external_documents_ids_builder.insert(external_id, new_docid as u64)?;
-                    new_documents_ids.insert(new_docid);
-                    (new_docid, update_obkv)
+                    (new_docid, false)
                 }
             };
+
+            let obkv = Self::add_and_merge_original_document(
+                wtxn,
+                updated,
+                external_id,
+                docid,
+                update_obkv,
+                &mut obkv_buffer,
+                documents,
+                index_documents_method,
+                field_distribution,
+                fields_ids_map,
+                &mut replaced_documents_ids,
+                new_documents_ids,
+                &mut new_external_documents_ids_builder,
+            )?;
 
             // We insert the document under the documents ids map into the final file.
             final_sorter.insert(docid.to_be_bytes(), obkv)?;
             documents_count += 1;
-
-            let reader = obkv::KvReader::new(obkv);
-            for (field_id, _) in reader.iter() {
-                let field_name = fields_ids_map.name(field_id).unwrap();
-                *field_distribution.entry(field_name.to_string()).or_default() += 1;
-            }
         }
 
         let before_docids_merging = Instant::now();
@@ -445,6 +419,76 @@ impl<'a, 'i> Transform<'a, 'i> {
         documents_file.seek(SeekFrom::Start(0))?;
 
         Ok((documents_count, replaced_documents_ids, documents_file))
+    }
+
+    /// Update all the informations concerning a document addition.
+    /// Must only be called when updating an original document.
+    /// (= do not call it when updating a flattened document)
+    pub fn add_and_merge_original_document<'buffer>(
+        wtxn: &heed::RwTxn,
+        // normal parameters
+        updated: bool,
+        external_id: &[u8],
+        docid: u32,
+        document: &'buffer [u8],
+        obkv_buffer: &'buffer mut Vec<u8>,
+        // what should be in self
+        documents: &Database<OwnedType<BEU32>, ObkvCodec>,
+        index_documents_method: IndexDocumentsMethod,
+        field_distribution: &mut FieldDistribution,
+        fields_ids_map: &mut FieldsIdsMap,
+        // I don't know for these three
+        replaced_documents_ids: &mut RoaringBitmap,
+        new_documents_ids: &mut RoaringBitmap,
+        new_external_documents_ids_builder: &mut MapBuilder<Vec<u8>>,
+    ) -> Result<&'buffer [u8]> {
+        let obkv = if updated {
+            // If we find the user id in the current external documents ids map
+            // we use it and insert it in the list of replaced documents.
+            replaced_documents_ids.insert(docid);
+
+            let key = BEU32::new(docid);
+            let base_obkv =
+                documents.get(wtxn, &key)?.ok_or(InternalError::DatabaseMissingEntry {
+                    db_name: db_name::DOCUMENTS,
+                    key: None,
+                })?;
+
+            // we remove all the fields that were already counted
+            for (field_id, _) in base_obkv.iter() {
+                let field_name = fields_ids_map.name(field_id).unwrap();
+                if let Entry::Occupied(mut entry) = field_distribution.entry(field_name.to_string())
+                {
+                    match entry.get().checked_sub(1) {
+                        Some(0) | None => entry.remove(),
+                        Some(count) => entry.insert(count),
+                    };
+                }
+            }
+
+            // Depending on the update indexing method we will merge
+            // the document update with the current document or not.
+            match index_documents_method {
+                IndexDocumentsMethod::ReplaceDocuments => document,
+                IndexDocumentsMethod::UpdateDocuments => {
+                    let document = obkv::KvReader::new(document);
+                    merge_two_obkvs(base_obkv, document, obkv_buffer);
+                    obkv_buffer.as_slice()
+                }
+            }
+        } else {
+            new_external_documents_ids_builder.insert(external_id, docid as u64)?;
+            new_documents_ids.insert(docid);
+            document
+        };
+
+        let reader = obkv::KvReader::new(obkv);
+        for (field_id, _) in reader.iter() {
+            let field_name = fields_ids_map.name(field_id).unwrap();
+            *field_distribution.entry(field_name.to_string()).or_default() += 1;
+        }
+
+        Ok(obkv)
     }
 
     /// Returns a `TransformOutput` with a file that contains the documents of the index
