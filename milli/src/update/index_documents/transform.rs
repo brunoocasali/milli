@@ -5,6 +5,8 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::time::Instant;
 
+use heed::types::OwnedType;
+use heed::Database;
 use itertools::Itertools;
 use log::info;
 use roaring::RoaringBitmap;
@@ -18,22 +20,21 @@ use crate::documents::{DocumentBatchReader, DocumentsBatchIndex};
 use crate::error::{Error, InternalError, UserError};
 use crate::index::db_name;
 use crate::update::{AvailableDocumentsIds, UpdateIndexingStep};
-use crate::{ExternalDocumentsIds, FieldDistribution, FieldId, FieldsIdsMap, Index, Result, BEU32};
+use crate::{
+    ExternalDocumentsIds, FieldDistribution, FieldId, FieldsIdsMap, Index, ObkvCodec, Result, BEU32,
+};
 
 const DEFAULT_PRIMARY_KEY_NAME: &str = "id";
 
 pub struct TransformOutput {
     pub primary_key: String,
-
     pub fields_ids_map: FieldsIdsMap,
     pub field_distribution: FieldDistribution,
     pub external_documents_ids: ExternalDocumentsIds<'static>,
     pub new_documents_ids: RoaringBitmap,
     pub replaced_documents_ids: RoaringBitmap,
-
     pub documents_count: usize,
-    pub original_documents: File,
-    pub flattened_documents: File,
+    pub documents_file: File,
 }
 
 /// Extract the external ids, deduplicate and compute the new internal documents ids
@@ -48,8 +49,7 @@ pub struct Transform<'a, 'i> {
     pub autogenerate_docids: bool,
     pub index_documents_method: IndexDocumentsMethod,
 
-    original_sorter: grenad::Sorter<MergeFn>,
-    flattened_sorter: grenad::Sorter<MergeFn>,
+    sorter: grenad::Sorter<MergeFn>,
     documents_count: usize,
 }
 
@@ -100,16 +100,7 @@ impl<'a, 'i> Transform<'a, 'i> {
         };
 
         // We initialize the sorter with the user indexing settings.
-        let original_sorter = create_sorter(
-            merge_function,
-            indexer_settings.chunk_compression_type,
-            indexer_settings.chunk_compression_level,
-            indexer_settings.max_nb_chunks,
-            indexer_settings.max_memory,
-        );
-
-        // We initialize the sorter with the user indexing settings.
-        let flattened_sorter = create_sorter(
+        let sorter = create_sorter(
             merge_function,
             indexer_settings.chunk_compression_type,
             indexer_settings.chunk_compression_level,
@@ -118,13 +109,12 @@ impl<'a, 'i> Transform<'a, 'i> {
         );
 
         Transform {
+            index,
             indexer_settings,
             autogenerate_docids,
-            original_sorter,
-            flattened_sorter,
+            sorter,
             documents_count: 0,
             index_documents_method,
-            index,
         }
     }
 
@@ -158,43 +148,18 @@ impl<'a, 'i> Transform<'a, 'i> {
         let mut obkv_buffer = Vec::new();
         let mut documents_count = 0;
         let mut external_id_buffer = Vec::new();
-        // TODO: TAMO: maybe push our things in a Cow so we don't have to create a vec here
-        let mut original_field_buffer: Vec<(u16, &[u8])> = Vec::new();
-        let mut flattened_field_buffer: Vec<(u16, Vec<u8>)> = Vec::new();
+        let mut field_buffer: Vec<(u16, &[u8])> = Vec::new();
         while let Some((addition_index, document)) = reader.next_document_with_index()? {
-            let mut original_field_buffer_cache = drop_and_reuse(original_field_buffer);
-            let mut flattened_field_buffer_cache = drop_and_reuse(flattened_field_buffer);
-
+            let mut field_buffer_cache = drop_and_reuse(field_buffer);
             if self.indexer_settings.log_every_n.map_or(false, |len| documents_count % len == 0) {
                 progress_callback(UpdateIndexingStep::RemapDocumentAddition {
                     documents_seen: documents_count,
                 });
             }
 
-            // Regenerate the original document so we can flatten it
-            // let doc = fields_index.recreate_json(&document);
-            let mut doc = serde_json::Map::new();
-
             for (k, v) in document.iter() {
                 let mapped_id = *mapping.get(&k).unwrap();
-                let key = fields_ids_map.name(mapped_id).unwrap();
-                let value = serde_json::from_slice::<serde_json::Value>(v)
-                    .map_err(crate::error::InternalError::SerdeJson)?;
-                doc.insert(key.to_string(), value);
-            }
-
-            let flattened_doc = flatten_serde_json::flatten(&doc);
-
-            for (key, value) in flattened_doc.iter() {
-                // TODO: TAMO: send an error if the fid limit has been reached
-                let fid = fields_ids_map.insert(&key).unwrap();
-                let value = serde_json::to_vec(value).unwrap();
-                flattened_field_buffer_cache.push((fid, value));
-            }
-
-            for (key, value) in document.iter() {
-                let mapped_id = *mapping.get(&key).unwrap();
-                original_field_buffer_cache.push((mapped_id, value));
+                field_buffer_cache.push((mapped_id, v));
             }
 
             // We need to make sure that every document has a primary key. After we have remapped
@@ -203,82 +168,71 @@ impl<'a, 'i> Transform<'a, 'i> {
             // document. If none is found, and we were told to generate missing document ids, then
             // we create the missing field, and update the new document.
             let mut uuid_buffer = [0; uuid::adapter::Hyphenated::LENGTH];
-            let external_id = match original_field_buffer_cache
-                .iter_mut()
-                .find(|(id, _)| *id == primary_key_id)
-            {
-                Some((_, bytes)) => {
-                    let value = match serde_json::from_slice(bytes).unwrap() {
-                        Value::String(string) => match validate_document_id(&string) {
-                            Some(s) if s.len() == string.len() => string,
-                            Some(s) => s.to_string(),
-                            None => {
+            let external_id =
+                match field_buffer_cache.iter_mut().find(|(id, _)| *id == primary_key_id) {
+                    Some((_, bytes)) => {
+                        let value = match serde_json::from_slice(bytes).unwrap() {
+                            Value::String(string) => match validate_document_id(&string) {
+                                Some(s) if s.len() == string.len() => string,
+                                Some(s) => s.to_string(),
+                                None => {
+                                    return Err(UserError::InvalidDocumentId {
+                                        document_id: Value::String(string),
+                                    }
+                                    .into())
+                                }
+                            },
+                            Value::Number(number) => number.to_string(),
+                            content => {
                                 return Err(UserError::InvalidDocumentId {
-                                    document_id: Value::String(string),
+                                    document_id: content.clone(),
                                 }
                                 .into())
                             }
-                        },
-                        Value::Number(number) => number.to_string(),
-                        content => {
-                            return Err(UserError::InvalidDocumentId {
-                                document_id: content.clone(),
-                            }
-                            .into())
-                        }
-                    };
-                    serde_json::to_writer(&mut external_id_buffer, &value).unwrap();
-                    Cow::Owned(value)
-                }
-                None => {
-                    if !self.autogenerate_docids {
-                        let mut json = Map::new();
-                        for (key, value) in document.iter() {
-                            let key = addition_index.name(key).cloned();
-                            let value = serde_json::from_slice::<Value>(&value).ok();
-
-                            if let Some((k, v)) = key.zip(value) {
-                                json.insert(k, v);
-                            }
-                        }
-
-                        return Err(UserError::MissingDocumentId {
-                            primary_key: primary_key_name,
-                            document: json,
-                        }
-                        .into());
+                        };
+                        serde_json::to_writer(&mut external_id_buffer, &value).unwrap();
+                        Cow::Owned(value)
                     }
+                    None => {
+                        if !self.autogenerate_docids {
+                            let mut json = Map::new();
+                            for (key, value) in document.iter() {
+                                let key = addition_index.name(key).cloned();
+                                let value = serde_json::from_slice::<Value>(&value).ok();
 
-                    let uuid = uuid::Uuid::new_v4().to_hyphenated().encode_lower(&mut uuid_buffer);
-                    serde_json::to_writer(&mut external_id_buffer, &uuid).unwrap();
-                    original_field_buffer_cache.push((primary_key_id, &external_id_buffer));
-                    Cow::Borrowed(&*uuid)
-                }
-            };
+                                if let Some((k, v)) = key.zip(value) {
+                                    json.insert(k, v);
+                                }
+                            }
+
+                            return Err(UserError::MissingDocumentId {
+                                primary_key: primary_key_name,
+                                document: json,
+                            }
+                            .into());
+                        }
+
+                        let uuid =
+                            uuid::Uuid::new_v4().to_hyphenated().encode_lower(&mut uuid_buffer);
+                        serde_json::to_writer(&mut external_id_buffer, &uuid).unwrap();
+                        field_buffer_cache.push((primary_key_id, &external_id_buffer));
+                        Cow::Borrowed(&*uuid)
+                    }
+                };
 
             // Insertion in a obkv need to be done with keys ordered. For now they are ordered
             // according to the document addition key order, so we sort it according to the
             // fieldids map keys order.
-            original_field_buffer_cache.sort_unstable_by_key(|(key, _)| *key);
+            field_buffer_cache.sort_unstable_by(|(f1, _), (f2, _)| f1.cmp(&f2));
 
             // The last step is to build the new obkv document, and insert it in the sorter.
-            // first we do it with the un-modified documents
             let mut writer = obkv::KvWriter::new(&mut obkv_buffer);
-            for (k, v) in original_field_buffer_cache.iter() {
+            for (k, v) in field_buffer_cache.iter() {
                 writer.insert(*k, v)?;
             }
 
-            self.original_sorter.insert(&external_id.as_ref().as_bytes(), &obkv_buffer)?;
-
-            // and then we do it with the flattened documents
-            obkv_buffer.clear();
-            let mut writer = obkv::KvWriter::new(&mut obkv_buffer);
-            for (k, v) in flattened_field_buffer_cache.iter() {
-                writer.insert(*k, v)?;
-            }
-
-            self.flattened_sorter.insert(&external_id.as_ref().as_bytes(), &obkv_buffer)?;
-
+            // We use the extracted/generated user id as the key for this document.
+            self.sorter.insert(&external_id.as_ref().as_bytes(), &obkv_buffer)?;
             documents_count += 1;
 
             progress_callback(UpdateIndexingStep::RemapDocumentAddition {
@@ -286,8 +240,7 @@ impl<'a, 'i> Transform<'a, 'i> {
             });
 
             obkv_buffer.clear();
-            original_field_buffer = drop_and_reuse(original_field_buffer_cache);
-            flattened_field_buffer = drop_and_reuse(flattened_field_buffer_cache);
+            field_buffer = drop_and_reuse(field_buffer_cache);
             external_id_buffer.clear();
         }
 
@@ -307,9 +260,9 @@ impl<'a, 'i> Transform<'a, 'i> {
     /// format like CSV, JSON or JSON stream. This sorter must contain a key that is the document
     /// id for the user side and the value must be an obkv where keys are valid fields ids.
     pub(crate) fn output_from_sorter<F>(
-        mut self,
+        self,
         wtxn: &mut heed::RwTxn,
-        progress_callback: &F,
+        progress_callback: F,
     ) -> Result<TransformOutput>
     where
         F: Fn(UpdateIndexingStep) + Sync,
@@ -319,162 +272,70 @@ impl<'a, 'i> Transform<'a, 'i> {
             .primary_key(&wtxn)?
             .ok_or(Error::UserError(UserError::MissingPrimaryKey))?
             .to_string();
-        let fields_ids_map = self.index.fields_ids_map(wtxn)?;
-        let approximate_number_of_documents = self.documents_count;
+        let mut fields_ids_map = self.index.fields_ids_map(wtxn)?;
 
-        let mut external_documents_ids = self.index.external_documents_ids(wtxn).unwrap();
+        let mut documents_ids = self.index.documents_ids(wtxn)?;
+        let mut field_distribution = self.index.field_distribution(wtxn)?;
+        let mut external_documents_ids = self.index.external_documents_ids(wtxn)?;
 
-        let (documents_count, original_sorter, new_external_documents_ids_builder) = self
-            .merge_documents_in_sorter(
-                wtxn,
-                self.original_sorter,
-                &mut external_documents_ids,
-                progress_callback,
-            )?;
+        let total_documents = self.documents_count;
+
+        let mut new_documents_ids = RoaringBitmap::new();
+
+        let (documents_count, replaced_documents_ids, documents_file) = Self::write_final_sorter(
+            wtxn,
+            self.indexer_settings,
+            self.sorter,
+            &self.index.documents,
+            self.index_documents_method,
+            total_documents,
+            &mut field_distribution,
+            &mut fields_ids_map,
+            &mut documents_ids,
+            &mut external_documents_ids,
+            &mut new_documents_ids,
+            &progress_callback,
+        )?;
 
         progress_callback(UpdateIndexingStep::ComputeIdsAndMergeDocuments {
             documents_seen: documents_count,
             total_documents: documents_count,
         });
 
-        // We create a final writer to write the new documents in order from the sorter.
-        let mut original_writer = create_writer(
-            self.indexer_settings.chunk_compression_type,
-            self.indexer_settings.chunk_compression_level,
-            tempfile::tempfile()?,
-        );
-
-        // Once we have written all the documents into the final sorter, we write the documents
-        // into this writer, extract the file and reset the seek to be able to read it again.
-        original_sorter.write_into_stream_writer(&mut original_writer)?;
-        let mut documents_file = original_writer.into_inner()?;
-        documents_file.seek(SeekFrom::Start(0))?;
-
-        let mut flattened_writer = create_writer(
-            self.indexer_settings.chunk_compression_type,
-            self.indexer_settings.chunk_compression_level,
-            tempfile::tempfile()?,
-        );
-
-        let mut flattened_documents = flattened_writer.into_inner()?;
-        flattened_documents.seek(SeekFrom::Start(0))?;
-
-        let before_docids_merging = Instant::now();
-        // We merge the new external ids with existing external documents ids.
-        let new_external_documents_ids = new_external_documents_ids_builder.into_map();
-        external_documents_ids.insert_ids(&new_external_documents_ids)?;
-
-        info!("Documents external merging took {:.02?}", before_docids_merging.elapsed());
-
         Ok(TransformOutput {
             primary_key,
             fields_ids_map,
-            field_distribution: self.index.field_distribution(wtxn)?,
-            external_documents_ids: external_documents_ids.into_static(),
-            new_documents_ids: RoaringBitmap::new(),
-            replaced_documents_ids: RoaringBitmap::new(),
-            documents_count,
-            original_documents: documents_file,
-            flattened_documents,
-        })
-    }
-
-    /// Returns a `TransformOutput` with a file that contains the documents of the index
-    /// with the attributes reordered accordingly to the `FieldsIdsMap` given as argument.
-    // TODO this can be done in parallel by using the rayon `ThreadPool`.
-    pub fn remap_index_documents(
-        self,
-        wtxn: &mut heed::RwTxn,
-        old_fields_ids_map: FieldsIdsMap,
-        new_fields_ids_map: FieldsIdsMap,
-    ) -> Result<TransformOutput> {
-        // There already has been a document addition, the primary key should be set by now.
-        let primary_key =
-            self.index.primary_key(wtxn)?.ok_or(UserError::MissingPrimaryKey)?.to_string();
-        let field_distribution = self.index.field_distribution(wtxn)?;
-        let external_documents_ids = self.index.external_documents_ids(wtxn)?;
-        let documents_ids = self.index.documents_ids(wtxn)?;
-        let documents_count = documents_ids.len() as usize;
-
-        // We create a final writer to write the new documents in order from the sorter.
-        let mut writer = create_writer(
-            self.indexer_settings.chunk_compression_type,
-            self.indexer_settings.chunk_compression_level,
-            tempfile::tempfile()?,
-        );
-
-        // TODO: TAMO: remove this
-        // We create a final writer to write the new documents in order from the sorter.
-        let mut flattened_writer = create_writer(
-            self.indexer_settings.chunk_compression_type,
-            self.indexer_settings.chunk_compression_level,
-            tempfile::tempfile()?,
-        );
-
-        let mut obkv_buffer = Vec::new();
-        for result in self.index.documents.iter(wtxn)? {
-            let (docid, obkv) = result?;
-            let docid = docid.get();
-
-            obkv_buffer.clear();
-            let mut obkv_writer = obkv::KvWriter::<_, FieldId>::new(&mut obkv_buffer);
-
-            // We iterate over the new `FieldsIdsMap` ids in order and construct the new obkv.
-            for (id, name) in new_fields_ids_map.iter() {
-                if let Some(val) = old_fields_ids_map.id(name).and_then(|id| obkv.get(id)) {
-                    obkv_writer.insert(id, val)?;
-                }
-            }
-
-            let buffer = obkv_writer.into_inner()?;
-            writer.insert(docid.to_be_bytes(), buffer)?;
-        }
-
-        // Once we have written all the documents, we extract
-        // the file and reset the seek to be able to read it again.
-        let mut original_documents = writer.into_inner()?;
-        original_documents.seek(SeekFrom::Start(0))?;
-
-        let mut flattened_documents = flattened_writer.into_inner()?;
-        flattened_documents.seek(SeekFrom::Start(0))?;
-
-        Ok(TransformOutput {
-            primary_key,
-            fields_ids_map: new_fields_ids_map,
             field_distribution,
             external_documents_ids: external_documents_ids.into_static(),
-            new_documents_ids: documents_ids,
-            replaced_documents_ids: RoaringBitmap::default(),
+            new_documents_ids,
+            replaced_documents_ids,
             documents_count,
-            original_documents,
-            flattened_documents,
+            documents_file,
         })
     }
 
-    fn merge_documents_in_sorter<F>(
-        &mut self,
-        wtxn: &mut heed::RwTxn,
+    /// TODO: TAMO: documentation
+    pub(crate) fn write_final_sorter<F>(
+        wtxn: &heed::RwTxn,
+        indexer_settings: &IndexerConfig,
         sorter: grenad::Sorter<MergeFn>,
+        documents: &Database<OwnedType<BEU32>, ObkvCodec>,
+        index_documents_method: IndexDocumentsMethod,
+        total_documents: usize,
+        field_distribution: &mut FieldDistribution,
+        fields_ids_map: &mut FieldsIdsMap,
+        documents_ids: &mut RoaringBitmap,
         external_documents_ids: &mut ExternalDocumentsIds,
+        new_documents_ids: &mut RoaringBitmap,
         progress_callback: F,
-    ) -> Result<(usize, grenad::Sorter<MergeFn>, fst::MapBuilder<Vec<u8>>)>
+    ) -> Result<(usize, RoaringBitmap, File)>
     where
         F: Fn(UpdateIndexingStep) + Sync,
     {
-        // we'll count the total number of new documents
-        let mut documents_count = 0;
-
-        let documents_ids = self.index.documents_ids(wtxn)?;
-        let mut available_documents_ids = AvailableDocumentsIds::from_documents_ids(&documents_ids);
-        let mut new_external_documents_ids_builder = fst::MapBuilder::memory();
-        let mut replaced_documents_ids = RoaringBitmap::new();
-        let mut field_distribution = self.index.field_distribution(wtxn)?;
-        let mut new_documents_ids = RoaringBitmap::new();
         let mut obkv_buffer = Vec::new();
-        let fields_ids_map = self.index.fields_ids_map(wtxn).unwrap();
-
-        // consume sorter, in order to free the internal allocation, before creating a new one.
-        let mut iter = sorter.into_stream_merger_iter()?;
+        let mut replaced_documents_ids = RoaringBitmap::new();
+        let mut new_external_documents_ids_builder = fst::MapBuilder::memory();
+        let mut available_documents_ids = AvailableDocumentsIds::from_documents_ids(documents_ids);
 
         // Once we have sort and deduplicated the documents we write them into a final file.
         let mut final_sorter = create_sorter(
@@ -485,18 +346,23 @@ impl<'a, 'i> Transform<'a, 'i> {
                     Err(InternalError::IndexingMergingKeys { process: "documents" }.into())
                 }
             },
-            self.indexer_settings.chunk_compression_type,
-            self.indexer_settings.chunk_compression_level,
-            self.indexer_settings.max_nb_chunks,
-            self.indexer_settings.max_memory,
+            indexer_settings.chunk_compression_type,
+            indexer_settings.chunk_compression_level,
+            indexer_settings.max_nb_chunks,
+            indexer_settings.max_memory,
         );
 
+        // consume sorter, in order to free the internal allocation, before creating a new one.
+        let mut iter = sorter.into_stream_merger_iter()?;
+
         // While we write into final file we get or generate the internal documents ids.
+        let mut documents_count = 0;
+
         while let Some((external_id, update_obkv)) = iter.next()? {
-            if self.indexer_settings.log_every_n.map_or(false, |len| documents_count % len == 0) {
+            if indexer_settings.log_every_n.map_or(false, |len| documents_count % len == 0) {
                 progress_callback(UpdateIndexingStep::ComputeIdsAndMergeDocuments {
                     documents_seen: documents_count,
-                    total_documents: self.documents_count,
+                    total_documents,
                 });
             }
 
@@ -507,12 +373,11 @@ impl<'a, 'i> Transform<'a, 'i> {
                     replaced_documents_ids.insert(docid);
 
                     let key = BEU32::new(docid);
-                    let base_obkv = self.index.documents.get(wtxn, &key)?.ok_or(
-                        InternalError::DatabaseMissingEntry {
+                    let base_obkv =
+                        documents.get(wtxn, &key)?.ok_or(InternalError::DatabaseMissingEntry {
                             db_name: db_name::DOCUMENTS,
                             key: None,
-                        },
-                    )?;
+                        })?;
 
                     // we remove all the fields that were already counted
                     for (field_id, _) in base_obkv.iter() {
@@ -529,7 +394,7 @@ impl<'a, 'i> Transform<'a, 'i> {
 
                     // Depending on the update indexing method we will merge
                     // the document update with the current document or not.
-                    match self.index_documents_method {
+                    match index_documents_method {
                         IndexDocumentsMethod::ReplaceDocuments => (docid, update_obkv),
                         IndexDocumentsMethod::UpdateDocuments => {
                             let update_obkv = obkv::KvReader::new(update_obkv);
@@ -560,7 +425,86 @@ impl<'a, 'i> Transform<'a, 'i> {
             }
         }
 
-        Ok((documents_count, final_sorter, new_external_documents_ids_builder))
+        let before_docids_merging = Instant::now();
+        // We merge the new external ids with existing external documents ids.
+        let new_external_documents_ids = new_external_documents_ids_builder.into_map();
+        external_documents_ids.insert_ids(&new_external_documents_ids)?;
+        info!("Documents external merging took {:.02?}", before_docids_merging.elapsed());
+
+        // We create a final writer to write the new documents in order from the sorter.
+        let mut writer = create_writer(
+            indexer_settings.chunk_compression_type,
+            indexer_settings.chunk_compression_level,
+            tempfile::tempfile()?,
+        );
+
+        // Once we have written all the documents into the final sorter, we write the documents
+        // into this writer, extract the file and reset the seek to be able to read it again.
+        final_sorter.write_into_stream_writer(&mut writer)?;
+        let mut documents_file = writer.into_inner()?;
+        documents_file.seek(SeekFrom::Start(0))?;
+
+        Ok((documents_count, replaced_documents_ids, documents_file))
+    }
+
+    /// Returns a `TransformOutput` with a file that contains the documents of the index
+    /// with the attributes reordered accordingly to the `FieldsIdsMap` given as argument.
+    // TODO this can be done in parallel by using the rayon `ThreadPool`.
+    pub fn remap_index_documents(
+        self,
+        wtxn: &mut heed::RwTxn,
+        old_fields_ids_map: FieldsIdsMap,
+        new_fields_ids_map: FieldsIdsMap,
+    ) -> Result<TransformOutput> {
+        // There already has been a document addition, the primary key should be set by now.
+        let primary_key =
+            self.index.primary_key(wtxn)?.ok_or(UserError::MissingPrimaryKey)?.to_string();
+        let field_distribution = self.index.field_distribution(wtxn)?;
+        let external_documents_ids = self.index.external_documents_ids(wtxn)?;
+        let documents_ids = self.index.documents_ids(wtxn)?;
+        let documents_count = documents_ids.len() as usize;
+
+        // We create a final writer to write the new documents in order from the sorter.
+        let mut writer = create_writer(
+            self.indexer_settings.chunk_compression_type,
+            self.indexer_settings.chunk_compression_level,
+            tempfile::tempfile()?,
+        );
+
+        let mut obkv_buffer = Vec::new();
+        for result in self.index.documents.iter(wtxn)? {
+            let (docid, obkv) = result?;
+            let docid = docid.get();
+
+            obkv_buffer.clear();
+            let mut obkv_writer = obkv::KvWriter::<_, FieldId>::new(&mut obkv_buffer);
+
+            // We iterate over the new `FieldsIdsMap` ids in order and construct the new obkv.
+            for (id, name) in new_fields_ids_map.iter() {
+                if let Some(val) = old_fields_ids_map.id(name).and_then(|id| obkv.get(id)) {
+                    obkv_writer.insert(id, val)?;
+                }
+            }
+
+            let buffer = obkv_writer.into_inner()?;
+            writer.insert(docid.to_be_bytes(), buffer)?;
+        }
+
+        // Once we have written all the documents, we extract
+        // the file and reset the seek to be able to read it again.
+        let mut documents_file = writer.into_inner()?;
+        documents_file.seek(SeekFrom::Start(0))?;
+
+        Ok(TransformOutput {
+            primary_key,
+            fields_ids_map: new_fields_ids_map,
+            field_distribution,
+            external_documents_ids: external_documents_ids.into_static(),
+            new_documents_ids: documents_ids,
+            replaced_documents_ids: RoaringBitmap::default(),
+            documents_count,
+            documents_file,
+        })
     }
 }
 
