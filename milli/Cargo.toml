@@ -13,6 +13,7 @@ concat-arrays = "0.1.2"
 crossbeam-channel = "0.5.1"
 either = "1.6.1"
 flate2 = "1.0.20"
+flatten-serde-json = "0.1.0"
 fst = "0.4.5"
 fxhash = "0.2.1"
 grenad = { version = "0.4.1", default-features = false, features = ["tempfile"] }

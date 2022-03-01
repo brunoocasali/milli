@@ -169,7 +169,8 @@ where
             new_documents_ids,
             replaced_documents_ids,
             documents_count,
-            documents_file,
+            original_documents,
+            flattened_documents,
         } = output;
 
         // The fields_ids_map is put back to the store now so the rest of the transaction sees an
@@ -195,7 +196,8 @@ where
             }
         };
 
-        let documents_file = grenad::Reader::new(documents_file)?;
+        // TODO: TAMO: It's here
+        let documents_file = grenad::Reader::new(original_documents)?;
 
         // create LMDB writer channel
         let (lmdb_writer_sx, lmdb_writer_rx): (
