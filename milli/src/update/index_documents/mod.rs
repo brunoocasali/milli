@@ -169,9 +169,8 @@ where
             new_documents_ids,
             replaced_documents_ids,
             documents_count,
-            // original_documents,
-            // flattened_documents,
-            documents_file,
+            original_documents,
+            flattened_documents,
         } = output;
 
         // The fields_ids_map is put back to the store now so the rest of the transaction sees an
@@ -197,8 +196,8 @@ where
             }
         };
 
-        // TODO: TAMO: It's here
-        let documents_file = grenad::Reader::new(documents_file)?;
+        let original_documents = grenad::Reader::new(original_documents)?;
+        let flattened_documents = grenad::Reader::new(flattened_documents)?;
 
         // create LMDB writer channel
         let (lmdb_writer_sx, lmdb_writer_rx): (
@@ -240,26 +239,36 @@ where
             };
 
             // split obkv file into several chuncks
-            let chunk_iter = grenad_obkv_into_chunks(
-                documents_file,
+            let original_chunk_iter = grenad_obkv_into_chunks(
+                original_documents,
                 params.clone(),
                 self.indexer_config.documents_chunk_size.unwrap_or(1024 * 1024 * 4), // 4MiB
             );
 
-            let result = chunk_iter.map(|chunk_iter| {
-                // extract all databases from the chunked obkv douments
-                extract::data_from_obkv_documents(
-                    chunk_iter,
-                    params,
-                    lmdb_writer_sx.clone(),
-                    searchable_fields,
-                    faceted_fields,
-                    primary_key_id,
-                    geo_field_id,
-                    stop_words,
-                    self.indexer_config.max_positions_per_attributes,
-                )
-            });
+            // split obkv file into several chuncks
+            let flattened_chunk_iter = grenad_obkv_into_chunks(
+                flattened_documents,
+                params.clone(),
+                self.indexer_config.documents_chunk_size.unwrap_or(1024 * 1024 * 4), // 4MiB
+            );
+
+            let result = original_chunk_iter
+                .and_then(|original_chunck_iter| Ok((original_chunck_iter, flattened_chunk_iter?)))
+                .map(|(original_chunk, flattened_chunk)| {
+                    // extract all databases from the chunked obkv douments
+                    extract::data_from_obkv_documents(
+                        original_chunk,
+                        flattened_chunk,
+                        params,
+                        lmdb_writer_sx.clone(),
+                        searchable_fields,
+                        faceted_fields,
+                        primary_key_id,
+                        geo_field_id,
+                        stop_words,
+                        self.indexer_config.max_positions_per_attributes,
+                    )
+                });
 
             if let Err(e) = result {
                 let _ = lmdb_writer_sx.send(Err(e));

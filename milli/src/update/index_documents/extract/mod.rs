@@ -34,7 +34,8 @@ use crate::{FieldId, Result};
 /// Extract data for each databases from obkv documents in parallel.
 /// Send data in grenad file over provided Sender.
 pub(crate) fn data_from_obkv_documents(
-    obkv_chunks: impl Iterator<Item = Result<grenad::Reader<File>>> + Send,
+    original_obkv_chunks: impl Iterator<Item = Result<grenad::Reader<File>>> + Send,
+    flattened_obkv_chunks: impl Iterator<Item = Result<grenad::Reader<File>>> + Send,
     indexer: GrenadParameters,
     lmdb_writer_sx: Sender<Result<TypedChunk>>,
     searchable_fields: Option<HashSet<FieldId>>,
@@ -44,11 +45,13 @@ pub(crate) fn data_from_obkv_documents(
     stop_words: Option<fst::Set<&[u8]>>,
     max_positions_per_attributes: Option<u32>,
 ) -> Result<()> {
-    let result: Result<(Vec<_>, (Vec<_>, Vec<_>))> = obkv_chunks
+    let result: Result<(Vec<_>, (Vec<_>, Vec<_>))> = original_obkv_chunks
+        .zip(flattened_obkv_chunks)
         .par_bridge()
-        .map(|result| {
+        .map(|(original_obkv_chunks, flattened_obkv_chunks)| {
             extract_documents_data(
-                result,
+                original_obkv_chunks,
+                flattened_obkv_chunks,
                 indexer,
                 lmdb_writer_sx.clone(),
                 &searchable_fields,
@@ -171,7 +174,8 @@ fn spawn_extraction_task<FE, FS>(
 /// - docid_fid_facet_numbers
 /// - docid_fid_facet_strings
 fn extract_documents_data(
-    documents_chunk: Result<grenad::Reader<File>>,
+    original_documents_chunk: Result<grenad::Reader<File>>,
+    flattened_documents_chunk: Result<grenad::Reader<File>>,
     indexer: GrenadParameters,
     lmdb_writer_sx: Sender<Result<TypedChunk>>,
     searchable_fields: &Option<HashSet<FieldId>>,
@@ -184,12 +188,16 @@ fn extract_documents_data(
     grenad::Reader<CursorClonableMmap>,
     (grenad::Reader<CursorClonableMmap>, grenad::Reader<CursorClonableMmap>),
 )> {
-    let documents_chunk = documents_chunk.and_then(|c| unsafe { as_cloneable_grenad(&c) })?;
+    let original_documents_chunk =
+        original_documents_chunk.and_then(|c| unsafe { as_cloneable_grenad(&c) })?;
 
-    let _ = lmdb_writer_sx.send(Ok(TypedChunk::Documents(documents_chunk.clone())));
+    let flattened_documents_chunk =
+        flattened_documents_chunk.and_then(|c| unsafe { as_cloneable_grenad(&c) })?;
+
+    let _ = lmdb_writer_sx.send(Ok(TypedChunk::Documents(original_documents_chunk)));
 
     if let Some(geo_field_id) = geo_field_id {
-        let documents_chunk_cloned = documents_chunk.clone();
+        let documents_chunk_cloned = flattened_documents_chunk.clone();
         let lmdb_writer_sx_cloned = lmdb_writer_sx.clone();
         rayon::spawn(move || {
             let result =
@@ -205,7 +213,7 @@ fn extract_documents_data(
         rayon::join(
             || {
                 let (documents_ids, docid_word_positions_chunk) = extract_docid_word_positions(
-                    documents_chunk.clone(),
+                    flattened_documents_chunk.clone(),
                     indexer.clone(),
                     searchable_fields,
                     stop_words.as_ref(),
@@ -226,7 +234,7 @@ fn extract_documents_data(
             || {
                 let (docid_fid_facet_numbers_chunk, docid_fid_facet_strings_chunk) =
                     extract_fid_docid_facet_values(
-                        documents_chunk.clone(),
+                        flattened_documents_chunk.clone(),
                         indexer.clone(),
                         faceted_fields,
                     )?;

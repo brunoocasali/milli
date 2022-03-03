@@ -10,6 +10,7 @@ use heed::types::OwnedType;
 use heed::Database;
 use itertools::Itertools;
 use log::info;
+use obkv::KvWriter;
 use roaring::RoaringBitmap;
 use serde_json::{Map, Value};
 
@@ -35,7 +36,8 @@ pub struct TransformOutput {
     pub new_documents_ids: RoaringBitmap,
     pub replaced_documents_ids: RoaringBitmap,
     pub documents_count: usize,
-    pub documents_file: File,
+    pub original_documents: File,
+    pub flattened_documents: File,
 }
 
 /// Extract the external ids, deduplicate and compute the new internal documents ids
@@ -50,7 +52,7 @@ pub struct Transform<'a, 'i> {
     pub autogenerate_docids: bool,
     pub index_documents_method: IndexDocumentsMethod,
 
-    sorter: grenad::Sorter<MergeFn>,
+    original_sorter: grenad::Sorter<MergeFn>,
     documents_count: usize,
 }
 
@@ -101,7 +103,7 @@ impl<'a, 'i> Transform<'a, 'i> {
         };
 
         // We initialize the sorter with the user indexing settings.
-        let sorter = create_sorter(
+        let original_sorter = create_sorter(
             merge_function,
             indexer_settings.chunk_compression_type,
             indexer_settings.chunk_compression_level,
@@ -113,7 +115,7 @@ impl<'a, 'i> Transform<'a, 'i> {
             index,
             indexer_settings,
             autogenerate_docids,
-            sorter,
+            original_sorter,
             documents_count: 0,
             index_documents_method,
         }
@@ -233,7 +235,7 @@ impl<'a, 'i> Transform<'a, 'i> {
             }
 
             // We use the extracted/generated user id as the key for this document.
-            self.sorter.insert(&external_id.as_ref().as_bytes(), &obkv_buffer)?;
+            self.original_sorter.insert(&external_id.as_ref().as_bytes(), &obkv_buffer)?;
             documents_count += 1;
 
             progress_callback(UpdateIndexingStep::RemapDocumentAddition {
@@ -283,20 +285,21 @@ impl<'a, 'i> Transform<'a, 'i> {
 
         let mut new_documents_ids = RoaringBitmap::new();
 
-        let (documents_count, replaced_documents_ids, documents_file) = Self::write_final_sorter(
-            wtxn,
-            self.sorter,
-            self.indexer_settings,
-            &self.index.documents,
-            self.index_documents_method,
-            total_documents,
-            &mut field_distribution,
-            &mut fields_ids_map,
-            &mut documents_ids,
-            &mut external_documents_ids,
-            &mut new_documents_ids,
-            &progress_callback,
-        )?;
+        let (documents_count, replaced_documents_ids, original_documents, flattened_documents) =
+            Self::write_final_sorter(
+                wtxn,
+                self.original_sorter,
+                self.indexer_settings,
+                &self.index.documents,
+                self.index_documents_method,
+                total_documents,
+                &mut field_distribution,
+                &mut fields_ids_map,
+                &mut documents_ids,
+                &mut external_documents_ids,
+                &mut new_documents_ids,
+                &progress_callback,
+            )?;
 
         progress_callback(UpdateIndexingStep::ComputeIdsAndMergeDocuments {
             documents_seen: documents_count,
@@ -311,7 +314,8 @@ impl<'a, 'i> Transform<'a, 'i> {
             new_documents_ids,
             replaced_documents_ids,
             documents_count,
-            documents_file,
+            original_documents,
+            flattened_documents,
         })
     }
 
@@ -319,7 +323,7 @@ impl<'a, 'i> Transform<'a, 'i> {
     pub(crate) fn write_final_sorter<F>(
         wtxn: &heed::RwTxn,
         // normal parameters
-        sorter: grenad::Sorter<MergeFn>,
+        original_sorter: grenad::Sorter<MergeFn>,
         // what should be in self
         indexer_settings: &IndexerConfig,
         documents: &Database<OwnedType<BEU32>, ObkvCodec>,
@@ -331,7 +335,7 @@ impl<'a, 'i> Transform<'a, 'i> {
         external_documents_ids: &mut ExternalDocumentsIds,
         new_documents_ids: &mut RoaringBitmap,
         progress_callback: F,
-    ) -> Result<(usize, RoaringBitmap, File)>
+    ) -> Result<(usize, RoaringBitmap, File, File)>
     where
         F: Fn(UpdateIndexingStep) + Sync,
     {
@@ -341,7 +345,22 @@ impl<'a, 'i> Transform<'a, 'i> {
         let mut available_documents_ids = AvailableDocumentsIds::from_documents_ids(documents_ids);
 
         // Once we have sort and deduplicated the documents we write them into a final file.
-        let mut final_sorter = create_sorter(
+        let mut original_final_sorter = create_sorter(
+            |_id, obkvs| {
+                if obkvs.len() == 1 {
+                    Ok(obkvs[0].clone())
+                } else {
+                    Err(InternalError::IndexingMergingKeys { process: "documents" }.into())
+                }
+            },
+            indexer_settings.chunk_compression_type,
+            indexer_settings.chunk_compression_level,
+            indexer_settings.max_nb_chunks,
+            indexer_settings.max_memory,
+        );
+
+        // Once we have sort and deduplicated the documents we write their flattened version into a final file.
+        let mut flattened_final_sorter = create_sorter(
             |_id, obkvs| {
                 if obkvs.len() == 1 {
                     Ok(obkvs[0].clone())
@@ -356,7 +375,7 @@ impl<'a, 'i> Transform<'a, 'i> {
         );
 
         // consume sorter, in order to free the internal allocation, before creating a new one.
-        let mut iter = sorter.into_stream_merger_iter()?;
+        let mut iter = original_sorter.into_stream_merger_iter()?;
 
         // While we write into final file we get or generate the internal documents ids.
         let mut documents_count = 0;
@@ -395,8 +414,34 @@ impl<'a, 'i> Transform<'a, 'i> {
             )?;
 
             // We insert the document under the documents ids map into the final file.
-            final_sorter.insert(docid.to_be_bytes(), obkv)?;
+            original_final_sorter.insert(docid.to_be_bytes(), obkv)?;
             documents_count += 1;
+
+            // Once we have the final document. We're going to flatten it
+            // and insert it in the flattened sorter.
+            let mut doc = serde_json::Map::new();
+
+            let reader = obkv::KvReader::new(obkv);
+            for (k, v) in reader.iter() {
+                let key = fields_ids_map.name(k).unwrap();
+                let value = serde_json::from_slice::<serde_json::Value>(v)
+                    .map_err(crate::error::InternalError::SerdeJson)?;
+                doc.insert(key.to_string(), value);
+            }
+
+            let flattened = flatten_serde_json::flatten(&doc);
+
+            // Once we have the flattened version we can convert it back to obkv and
+            // insert all the new generated fields_ids (if any) in the fields ids map.
+            let mut buffer: Vec<u8> = Vec::new();
+            let mut writer = KvWriter::new(&mut buffer);
+            for (key, value) in flattened {
+                let fid = fields_ids_map.insert(&key).ok_or(UserError::AttributeLimitReached)?;
+                let value = serde_json::to_vec(&value).unwrap();
+                writer.insert(fid, &value)?;
+            }
+
+            flattened_final_sorter.insert(docid.to_be_bytes(), &buffer)?;
         }
 
         let before_docids_merging = Instant::now();
@@ -414,14 +459,30 @@ impl<'a, 'i> Transform<'a, 'i> {
 
         // Once we have written all the documents into the final sorter, we write the documents
         // into this writer, extract the file and reset the seek to be able to read it again.
-        final_sorter.write_into_stream_writer(&mut writer)?;
-        let mut documents_file = writer.into_inner()?;
-        documents_file.seek(SeekFrom::Start(0))?;
+        original_final_sorter.write_into_stream_writer(&mut writer)?;
+        let mut original_documents = writer.into_inner()?;
+        original_documents.seek(SeekFrom::Start(0))?;
 
-        Ok((documents_count, replaced_documents_ids, documents_file))
+        // We create a final writer to write the new documents in order from the sorter.
+        let mut writer = create_writer(
+            indexer_settings.chunk_compression_type,
+            indexer_settings.chunk_compression_level,
+            tempfile::tempfile()?,
+        );
+
+        // Once we have written all the documents into the final sorter, we write the documents
+        // into this writer, extract the file and reset the seek to be able to read it again.
+        flattened_final_sorter.write_into_stream_writer(&mut writer)?;
+        let mut flattened_documents = writer.into_inner()?;
+        flattened_documents.seek(SeekFrom::Start(0))?;
+
+        Ok((documents_count, replaced_documents_ids, original_documents, flattened_documents))
     }
 
     /// Update all the informations concerning a document addition.
+    /// - Update the fields_ids_map with the new fields and delete the old fields.
+    /// - Update the field_distribution
+    /// - Generate the new document according to the merge strategy
     /// Must only be called when updating an original document.
     /// (= do not call it when updating a flattened document)
     pub fn add_and_merge_original_document<'buffer>(
@@ -509,7 +570,7 @@ impl<'a, 'i> Transform<'a, 'i> {
         let documents_count = documents_ids.len() as usize;
 
         // We create a final writer to write the new documents in order from the sorter.
-        let mut writer = create_writer(
+        let mut original_writer = create_writer(
             self.indexer_settings.chunk_compression_type,
             self.indexer_settings.chunk_compression_level,
             tempfile::tempfile()?,
@@ -531,13 +592,23 @@ impl<'a, 'i> Transform<'a, 'i> {
             }
 
             let buffer = obkv_writer.into_inner()?;
-            writer.insert(docid.to_be_bytes(), buffer)?;
+            original_writer.insert(docid.to_be_bytes(), buffer)?;
         }
 
         // Once we have written all the documents, we extract
         // the file and reset the seek to be able to read it again.
-        let mut documents_file = writer.into_inner()?;
-        documents_file.seek(SeekFrom::Start(0))?;
+        let mut original_documents = original_writer.into_inner()?;
+        original_documents.seek(SeekFrom::Start(0))?;
+
+        // TODO: TAMO
+        // We create a final writer to write the new documents in order from the sorter.
+        let flattened_writer = create_writer(
+            self.indexer_settings.chunk_compression_type,
+            self.indexer_settings.chunk_compression_level,
+            tempfile::tempfile()?,
+        );
+        let mut flattened_documents = flattened_writer.into_inner()?;
+        flattened_documents.seek(SeekFrom::Start(0))?;
 
         Ok(TransformOutput {
             primary_key,
@@ -547,7 +618,8 @@ impl<'a, 'i> Transform<'a, 'i> {
             new_documents_ids: documents_ids,
             replaced_documents_ids: RoaringBitmap::default(),
             documents_count,
-            documents_file,
+            original_documents,
+            flattened_documents,
         })
     }
 }
